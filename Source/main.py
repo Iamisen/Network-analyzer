@@ -12,9 +12,8 @@ class Element:
         self.degree = degree
 
     def __str__(self) -> str:
-        return """
-            Represents element objects such as springs dampers and inerters.
-            """
+        a = ["spring", "damper", "inerter"]
+        return f"{a[self.degree]} of constant {self.value}"
 
 class Node:
     def __init__(self, mass, x, element_coordinate_pair, excitation):
@@ -22,8 +21,8 @@ class Node:
         self.mass = mass
         self.x = x
         self.element_coordinate = element_coordinate_pair
-        self.elements = element_coordinate_pair[:,0]
-        self.coordinates = element_coordinate_pair[:,1]
+        self.elements = element_coordinate_pair[:][0]
+        self.coordinates = element_coordinate_pair[:][1]
         self.s = sym.Symbol("s")
 
     def __str__(self) -> str:
@@ -38,24 +37,27 @@ class Node:
         """
         Automatically returns the L.T. of the equation of motion
         """
-        rhs = self.excitation
-        lhs = self.mass*self.x + sum([
-            element.value*(self.x*self.s**element.deg - coordinate*self.s**element.deg) for element, coordinate in self.element_coordinate
+        lhs = self.excitation
+        rhs = self.mass*self.x + sum([
+            element.value*(self.x*self.s**element.degree - coordinate*self.s**element.degree) for element, coordinate in self.element_coordinate
         ])
         return rhs, lhs
     
 
 class Network:
     def __init__(self, topology, masses, excitation):
+        self.updated_df = False
         self.excitation = excitation
-
         self.topology = topology
         self.arr_topology = np.array(list(self.topology.values()))
-        self.asdf_topology = self.df_topology()
-
+        
         self.masses = self.reorder_masses(masses)
         self.coordinates = self.generate_coordinate()
+
+        self.asdf_topology = self.df_topology()
+
         self.elements = self.generate_elements()
+        self.update_asdf()
         self.nodes = self.generate_nodes()
 
 
@@ -85,7 +87,7 @@ class Network:
     
     def generate_elements(self):
         variables = [sym.Symbol(i) for i in self.topology.keys()]
-        objects = [Element(i,j) for [i,j] in self.topology[:][1,0]]
+        objects = [Element(i,j) for (i,j) in zip(self.asdf_topology.value, self.asdf_topology.deg)]
         return {
             key:value for (key,value) in zip(variables, objects)
         }
@@ -96,7 +98,7 @@ class Network:
     def generate_coordinate(self):
         coordinates = set()
         for i in self.arr_topology[:,2]:
-            coordinates = self.coordinates | i
+            coordinates = coordinates | i
         assert len(coordinates) == len(self.masses), "There should be one coordinate per mass element"
 
         return {i:sym.Symbol(i) for i in sorted(coordinates)}
@@ -113,42 +115,63 @@ class Network:
         nodes = []
 
         for i in range(len(self.coordinates)):
-            x = self.coordinates[i]
+            x = self.coordinates[f"x{i+1}"]
             mass = list(self.masses.values())[i]
             ops = self.excitation if i==0 else 0
 
-            temp =  self.asdf_topology.loc[
-                    (self.asdf_topology["first coordinate"] == x) or \
-                        (self.asdf_topology["second coordinate"] == x),
-                    "Element", "first coordinate", "second coordinate"]
-            mask1 = temp["first coordinate"]  == x
-            mask2 = temp["second coordinate"] == x
-            element_coord = pd.concat([temp["Element"], temp["first coordinate"]*mask1 + temp["second coordinate"]*mask2], axis=1)
+            temp =  self.asdf_topology[["Element", "first coordinate", "second coordinate"]]
+            mask1 = temp["first coordinate"]  == str(x)
+            mask2 = temp["second coordinate"] == str(x)
+            A = (temp["second coordinate"]*mask1)*(not mask2.all())
+            B = (temp["first coordinate"]*(not mask1.all()))*mask2
+
+            element_coord = pd.concat([temp["Element"], A+B], axis=1)
+            element_coord.columns = ["Elements", "Coordinate"]
+            element_coord = element_coord.drop(element_coord[element_coord['Coordinate'] == ''].index)
+            element_coord["Coordinate"] = [self.coordinates[i] for i in element_coord["Coordinate"]]
+            element_coord_tuples = [tuple(element_coord.iloc[i, [0, 1]]) for i in range(element_coord.shape[0])]
             
-            nodes.append(Node(mass, x, element_coord.itertuples(index=False, name=False), ops))
-        
+            nodes.append(Node(mass, x, element_coord_tuples, ops))
+
         return nodes
 
     def df_topology(self):
+        a = np.array([list(i) for i in self.arr_topology[:,2]])
+        #a = np.array([[self.coordinates[j] for j in i] for i in self.arr_topology[:,2]])
+
         return pd.DataFrame({
             "Element"            : self.topology.keys(),
             "deg"                : self.arr_topology[:,0],
             "value"              : self.arr_topology[:,1],
-            "first coordinate"   : self.coordinates[sorted(self.arr_topology[:,2])[0]],
-            "second coordinate"  : self.coordinates[sorted(self.arr_topology[:,2])[2]],
+            "first coordinate"   : a[:,0],
+            "second coordinate"  : a[:,1],
         })
 
     def transfer(self):
-        eqs = np.array([i.eom for i in self.nodes])
-        RHS, LHS = self.matricize(eqs[:,0], eqs[:,1])
-        solution = np.linalg.solve(RHS, LHS)
+        eqs = np.array([i.eom() for i in self.nodes])
+        RHS, LHS = self.matricize(eqs[:,:-1], eqs[:,-1])
+        solution = sym.linsolve((RHS, LHS), list(self.coordinates.values())).args[0]
         return solution[-1]/solution[0]
 
-    def matricize(self, rhs, lhs):
-        RHS = np.array(
-            [ [i.coeff(j) for j in self.coordinates.keys()] for i in rhs ]
+    def matricize(self, rhs, lhs):#switching rhs and lhs
+        RHS = sym.Matrix(
+            [ [i[0].coeff(j) for j in self.coordinates.keys()] for i in rhs ]
         )
-        LHS = np.array(
+        LHS = sym.Matrix(
             [[i] for i in [self.excitation]+[0]*(len(self.coordinates)-1)]
         )
         return RHS, LHS
+    
+    def update_asdf(self):
+        if (not self.updated_df):
+            #This may not be optimized
+            self.asdf_topology["Element"] = [self.elements[sym.Symbol(i)] for i in self.asdf_topology["Element"]]
+        self.updated_df = True
+    
+def is_float(input):
+    try:
+        float(input)
+        return True
+    except Exception as e:
+        print(e)
+        return False
