@@ -1,6 +1,10 @@
-import numpy as np  # type: ignore
-import sympy as sym # type: ignore
-import pandas as pd # type: ignore
+import numpy as np     # type: ignore
+import sympy as sym    # type: ignore
+import pandas as pd    # type: ignore
+import functools       # type: ignore
+import multiprocessing # type: ignore
+import time            # type: ignore
+
 
 """
 Takes in a network represented by its nodes
@@ -45,9 +49,11 @@ class Node:
     
 
 class Network:
+
     def __init__(self, topology, masses, excitation):
-        self.updated_df = False
-        self.excitation = excitation
+        self.transfer_func_calculated, self.updated_df = False, False
+        self.s, self.t = sym.Symbol("s"), sym.Symbol("t")
+        self.excitation = excitation #self.laplace_t(excitation)
         self.topology = topology
         self.arr_topology = np.array(list(self.topology.values()))
         
@@ -59,7 +65,6 @@ class Network:
         self.elements = self.generate_elements()
         self.update_asdf()
         self.nodes = self.generate_nodes()
-
 
     def __str__(self) -> str:
         return """
@@ -148,10 +153,42 @@ class Network:
         })
 
     def transfer(self):
-        eqs = np.array([i.eom() for i in self.nodes])
-        RHS, LHS = self.matricize(eqs[:,:-1], eqs[:,-1])
-        solution = sym.linsolve((RHS, LHS), list(self.coordinates.values())).args[0]
-        return solution[-1]/solution[0]
+        if not self.transfer_func_calculated:
+            eqs = np.array([i.eom() for i in self.nodes])
+            RHS, LHS = self.matricize(eqs[:,:-1], eqs[:,-1])
+            solution = sym.linsolve((RHS, LHS), list(self.coordinates.values())).args[0]
+            self.transfer_function = solution[-1]/solution[0]
+            return solution[-1]/solution[0]
+        else:
+            return self.transfer_function
+    
+    def overview(function):
+        #makes sure that the function doesn't run for more than 30 seconds
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            process = multiprocessing.Process(target=function, name=function.__name__, args=args, kwargs=kwargs)
+            process.start()
+            process.join(30)
+
+            if process.is_alive():
+                print(f"{function.__name__} took too long to excecute")
+                process.terminate()
+                process.join()
+        return wrapper
+    
+    @overview
+    def laplace_t(self, func):
+        try:
+            return sym.integrals.transforms.laplace_transform(func, self.t, self.s)[0]
+        except Exception as e:
+            return "Couldn't proceed :"+str(e)
+    
+    @overview
+    def inv_laplace(self, func):
+        try:
+            return sym.integrals.transforms.inverse_laplace_transform(func, self.s, self.t)
+        except Exception as e:
+            return "Couldn't proceed :"+str(e)
 
     def matricize(self, rhs, lhs):#switching rhs and lhs
         RHS = sym.Matrix(
